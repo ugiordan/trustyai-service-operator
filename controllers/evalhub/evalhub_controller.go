@@ -203,7 +203,6 @@ func (r *EvalHubReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&evalhubv1alpha1.EvalHub{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
-		Owns(&corev1.ConfigMap{}).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToEvalHubs)).
 		Complete(r)
 }
