@@ -255,16 +255,16 @@ var _ = Describe("NemoGuardrails Controller", func() {
 		pkgtls.SetProxyTLSArguments(previous, nil)
 		_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 		Expect(err).NotTo(HaveOccurred())
-		Eventually(func() string {
+		Eventually(func() bool {
 			current := &nemoguardrailsv1alpha1.NemoGuardrails{}
 			if err := k8sClient.Get(ctx, typeNamespacedName, current); err != nil {
-				return ""
+				return false
 			}
-			if condition := utils.GetStatusCondition(current.Status.Conditions, "DeploymentReady"); condition != nil {
-				return condition.Reason
+			if condition := utils.GetStatusCondition(current.Status.Conditions, utils.ConditionReconcileComplete); condition != nil {
+				return condition.Reason != pkgtls.ReasonProxyTLSProfileUnsupported
 			}
-			return ""
-		}, time.Second*10, time.Millisecond*100).ShouldNot(Equal(pkgtls.ReasonProxyTLSProfileUnsupported))
+			return false
+		}, time.Second*10, time.Millisecond*100).Should(BeTrue())
 	})
 
 	It("should add user environment variables to the deployment", func() {

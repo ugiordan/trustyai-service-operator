@@ -8,10 +8,12 @@ import (
 
 	trustyaiopendatahubiov1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1"
 	pkgtls "github.com/trustyai-explainability/trustyai-service-operator/pkg/tls"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // A cluster TLS profile the kube-rbac-proxy sidecars cannot serve fails the
@@ -24,6 +26,10 @@ func TestReconcileDeploymentReportsProxyTLSFailureAndRecovers(t *testing.T) {
 	scheme, owner := tasNetworkPolicyFixture(t)
 	owner.Spec.Storage.Format = STORAGE_DATABASE
 	owner.Spec.Storage.DatabaseConfigurations = "db"
+	owner.Status.Ready = corev1.ConditionTrue
+	owner.Status.Phase = PhaseReady
+	owner.SetStatus(ConditionTypeReady, "PreviouslyReady", "Service was ready", corev1.ConditionTrue)
+	owner.SetStatus(ConditionTypeProvisioningSucceeded, "ProvisioningComplete", "Service provisioning completed successfully", corev1.ConditionTrue)
 	recorder := record.NewFakeRecorder(10)
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -80,5 +86,59 @@ func TestReconcileDeploymentReportsProxyTLSFailureAndRecovers(t *testing.T) {
 	ready, _, err = checkCondition(current.Status.Conditions, ConditionTypeReady, corev1.ConditionFalse, false)
 	if err != nil || ready == nil || ready.Reason == pkgtls.ReasonProxyTLSProfileUnsupported {
 		t.Fatalf("TLS profile reason survived recovery: %#v (%v)", ready, err)
+	}
+	provisioning, _, err = checkCondition(current.Status.Conditions, ConditionTypeProvisioningSucceeded, corev1.ConditionFalse, false)
+	if err != nil || provisioning == nil || provisioning.Reason == "ProvisioningBlocked" {
+		t.Fatalf("TLS profile block survived provisioning recovery: %#v (%v)", provisioning, err)
+	}
+}
+
+func TestReconcileDeploymentPreservesUnrelatedErrorWithProxyTLSFailure(t *testing.T) {
+	ctx := context.Background()
+	scheme, owner := tasNetworkPolicyFixture(t)
+	owner.Spec.Storage.Format = STORAGE_DATABASE
+	owner.Spec.Storage.DatabaseConfigurations = "db"
+	owner.Status.Ready = corev1.ConditionTrue
+	owner.Status.Phase = PhaseReady
+	owner.SetStatus(ConditionTypeReady, "PreviouslyReady", "Service was ready", corev1.ConditionTrue)
+	owner.SetStatus(ConditionTypeProvisioningSucceeded, "ProvisioningComplete", "Service provisioning completed successfully", corev1.ConditionTrue)
+	apiErr := errors.New("deployment API read failed")
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(owner).
+		WithObjects(owner, createConfigMap(operatorNamespace, testKubeRBACProxyImage, testTrustAIServiceImage)).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, ok := obj.(*appsv1.Deployment); ok {
+					return apiErr
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	r := &TrustyAIServiceReconciler{Client: c, Scheme: scheme, Namespace: operatorNamespace}
+
+	previous, previousErr := pkgtls.CurrentProxyTLSArguments(), pkgtls.CurrentProxyTLSArgumentsError()
+	t.Cleanup(func() { pkgtls.SetProxyTLSArguments(previous, previousErr) })
+	pkgtls.SetProxyTLSArguments(pkgtls.ProxyTLSArguments{}, errors.New("cannot serve HTTP/2 with the selected TLS 1.2 cipher list"))
+
+	err := r.reconcileDeployment(ctx, owner, CustomCertificatesBundle{}, false)
+	if err != apiErr {
+		t.Fatalf("got error %v, want original Deployment API error %v", err, apiErr)
+	}
+
+	current := &trustyaiopendatahubiov1.TrustyAIService{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(owner), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Ready != corev1.ConditionTrue || current.Status.Phase != PhaseReady {
+		t.Fatalf("unrelated Deployment error changed existing status: ready=%s phase=%q", current.Status.Ready, current.Status.Phase)
+	}
+	ready, _, err := checkCondition(current.Status.Conditions, ConditionTypeReady, corev1.ConditionTrue, false)
+	if err != nil || ready == nil || ready.Reason != "PreviouslyReady" {
+		t.Fatalf("unrelated Deployment error changed Ready condition: %#v (%v)", ready, err)
+	}
+	provisioning, _, err := checkCondition(current.Status.Conditions, ConditionTypeProvisioningSucceeded, corev1.ConditionTrue, false)
+	if err != nil || provisioning == nil || provisioning.Reason != "ProvisioningComplete" {
+		t.Fatalf("unrelated Deployment error changed ProvisioningSucceeded condition: %#v (%v)", provisioning, err)
 	}
 }
