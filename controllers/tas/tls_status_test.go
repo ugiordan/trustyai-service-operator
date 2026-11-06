@@ -9,6 +9,7 @@ import (
 	trustyaiopendatahubiov1 "github.com/trustyai-explainability/trustyai-service-operator/api/tas/v1"
 	pkgtls "github.com/trustyai-explainability/trustyai-service-operator/pkg/tls"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -80,5 +81,50 @@ func TestReconcileDeploymentReportsProxyTLSFailureAndRecovers(t *testing.T) {
 	ready, _, err = checkCondition(current.Status.Conditions, ConditionTypeReady, corev1.ConditionFalse, false)
 	if err != nil || ready == nil || ready.Reason == pkgtls.ReasonProxyTLSProfileUnsupported {
 		t.Fatalf("TLS profile reason survived recovery: %#v (%v)", ready, err)
+	}
+	provisioning, _, err = checkCondition(current.Status.Conditions, ConditionTypeProvisioningSucceeded, corev1.ConditionFalse, false)
+	if err != nil || provisioning == nil || provisioning.Reason == "ProvisioningBlocked" {
+		t.Fatalf("blocked ProvisioningSucceeded reason survived recovery: %#v (%v)", provisioning, err)
+	}
+}
+
+func TestReconcileDeploymentDoesNotReportTLSForUnrelatedFailure(t *testing.T) {
+	ctx := context.Background()
+	scheme, owner := tasNetworkPolicyFixture(t)
+	owner.Spec.Storage.Format = STORAGE_PVC
+	owner.Status.Phase = PhaseReady
+	owner.Status.Ready = corev1.ConditionTrue
+	owner.SetStatus(ConditionTypeReady, "PreviouslyReady", "Previously ready", corev1.ConditionTrue)
+	owner.SetStatus(ConditionTypeProvisioningSucceeded, "ProvisioningComplete", "Provisioning completed", corev1.ConditionTrue)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(owner).
+		WithObjects(owner, createConfigMap(operatorNamespace, testKubeRBACProxyImage, testTrustAIServiceImage)).
+		Build()
+	r := &TrustyAIServiceReconciler{Client: c, Scheme: scheme, Namespace: operatorNamespace}
+
+	previous, previousErr := pkgtls.CurrentProxyTLSArguments(), pkgtls.CurrentProxyTLSArgumentsError()
+	t.Cleanup(func() { pkgtls.SetProxyTLSArguments(previous, previousErr) })
+	pkgtls.SetProxyTLSArguments(pkgtls.ProxyTLSArguments{}, errors.New("invalid proxy TLS profile"))
+
+	err := r.reconcileDeployment(ctx, owner, CustomCertificatesBundle{}, false)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("expected the missing PVC error, got %v", err)
+	}
+
+	current := &trustyaiopendatahubiov1.TrustyAIService{}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(owner), current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Ready != corev1.ConditionTrue || current.Status.Phase != PhaseReady {
+		t.Fatalf("unrelated render failure changed overall status: ready=%s phase=%q", current.Status.Ready, current.Status.Phase)
+	}
+	ready, _, err := checkCondition(current.Status.Conditions, ConditionTypeReady, corev1.ConditionTrue, false)
+	if err != nil || ready == nil || ready.Reason != "PreviouslyReady" {
+		t.Fatalf("unrelated render failure changed Ready: %#v (%v)", ready, err)
+	}
+	provisioning, _, err := checkCondition(current.Status.Conditions, ConditionTypeProvisioningSucceeded, corev1.ConditionTrue, false)
+	if err != nil || provisioning == nil || provisioning.Reason != "ProvisioningComplete" {
+		t.Fatalf("unrelated render failure changed ProvisioningSucceeded: %#v (%v)", provisioning, err)
 	}
 }

@@ -116,7 +116,7 @@ func (r *TrustyAIServiceReconciler) reconcileDeployment(ctx context.Context, ins
 		return nil
 	}
 	tlsErr := pkgtls.CurrentProxyTLSArgumentsError()
-	if tlsErr == nil {
+	if tlsErr == nil || !goerrors.Is(err, tlsErr) {
 		return err
 	}
 	message := fmt.Sprintf("%s: %v", pkgtls.ProxyTLSProfileUnsupportedMessage, tlsErr)
